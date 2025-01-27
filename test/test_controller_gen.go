@@ -58,3 +58,9 @@ func AutoAPI_handler_TestController_UserInfo_UserInfo_3(c *gin.Context) {
 		c.JSON(200, gin.H{"ok": false, "error": r2})
 	}
 }
+func AutoAPI_add_router_test_controller(group gin.RouterGroup) {
+	group.POST("/autoapi/TestController_int_none", AutoAPI_handler_TestController_int_none)
+	group.POST("/autoapi/TestController_UserInfo_UserInfo", AutoAPI_handler_TestController_UserInfo_UserInfo)
+	group.POST("/autoapi/TestController_UserInfo_UserInfo_2", AutoAPI_handler_TestController_UserInfo_UserInfo_2)
+	group.POST("/autoapi/TestController_UserInfo_UserInfo_3", AutoAPI_handler_TestController_UserInfo_UserInfo_3)
+}

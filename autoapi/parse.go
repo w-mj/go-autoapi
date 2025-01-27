@@ -6,6 +6,7 @@ import (
 	"go/format"
 	"go/parser"
 	"go/token"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -24,7 +25,7 @@ func WalkPath(root string) {
 			return filepath.SkipDir
 		}
 		if !d.IsDir() && strings.HasSuffix(d.Name(), ".go") {
-			p := &Parser{}
+			p := &Parser{RootDir: root}
 			p.Init()
 			p.ParseFile(path)
 		}
@@ -35,7 +36,13 @@ func WalkPath(root string) {
 	}
 }
 
+type FuncInfo struct {
+	Name    string
+	NumArgs int
+}
+
 type Parser struct {
+	RootDir string
 	Base    string
 	Name    string
 	Package string
@@ -44,7 +51,8 @@ type Parser struct {
 	ImportPath map[string]string
 	UsedImport map[string]string // path: name or path: nil
 
-	HandlerFunc []ast.Decl
+	HandlerFunc  []ast.Decl
+	FuncInfoList []FuncInfo
 }
 
 func (p *Parser) Init() {
@@ -56,6 +64,8 @@ func (p *Parser) Init() {
 func (p *Parser) ParseFile(root string) {
 	root = filepath.ToSlash(root)
 	p.Base, p.Name = path.Split(root)
+	p.Base = filepath.ToSlash(p.Base)
+	p.RootDir = filepath.ToSlash(p.RootDir)
 	var err error
 	a := token.NewFileSet()
 	pack, err := parser.ParseFile(a, root, nil, parser.ParseComments)
@@ -77,6 +87,7 @@ func (p *Parser) ParseFile(root string) {
 	if len(p.HandlerFunc) == 0 {
 		return
 	}
+	p.GenerateAddRouterFunc()
 	var im []*ast.ImportSpec
 	im = append(im, &ast.ImportSpec{
 		Path: &ast.BasicLit{Value: "\"github.com/gin-gonic/gin\"", Kind: token.STRING},
@@ -107,6 +118,17 @@ func (p *Parser) ParseFile(root string) {
 	if err := format.Node(genFile, outfset, out); err != nil {
 		fmt.Printf("cannot write to file, error: %s", err.Error())
 	}
+	_ = genFile.Close()
+	jsName := strings.TrimSuffix(p.Name, ".go") + ".js"
+	dir := path.Join(p.RootDir, "api_gen", strings.TrimPrefix(p.Base, p.RootDir))
+	os.MkdirAll(dir, 0755)
+	jsFile, err := os.OpenFile(path.Join(dir, jsName), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		fmt.Printf("cannot open generated js file, error: %s\n", err.Error())
+		return
+	}
+	p.GenerateJavaScript(jsFile)
+	_ = jsFile.Close()
 }
 
 func (p *Parser) ParseImportSpec(im *ast.ImportSpec) {
@@ -141,14 +163,7 @@ func (p *Parser) ParseFunction(fn *ast.FuncDecl) {
 		}}},
 	}
 	han.Body = &ast.BlockStmt{}
-	// 参数：0个
-	//      1个gin.Context
-	//      1个其他类型
-	//      2个其他类型和gin.Context
-	// 返回值：0个
-	//        1个error
-	//        1个其他类型
-	//        2个其他类型和error
+
 	if fn.Type.Params.NumFields() > 2 {
 		fmt.Printf("Handler function can only be 0, 1 or 2 params, but %s has %d.", fn.Name.Name, fn.Type.Params.NumFields())
 		return
@@ -161,12 +176,13 @@ func (p *Parser) ParseFunction(fn *ast.FuncDecl) {
 	han.Body.List = p.PrepareCall(fn, han.Body.List)
 	han.Body.List = p.PrepareReturns(fn, han.Body.List)
 	p.HandlerFunc = append(p.HandlerFunc, han)
+	p.FuncInfoList = append(p.FuncInfoList, FuncInfo{Name: fn.Name.Name, NumArgs: fn.Type.Params.NumFields()})
 
 	fmt.Printf("\tfunc %s(", fn.Name.Name)
 	for _, t := range fn.Type.Params.List {
 		fmt.Printf("%v,", t.Type)
 	}
-	fmt.Printf(")")
+	fmt.Printf(") -> ")
 	if fn.Type.Results != nil {
 		for _, t := range fn.Type.Results.List {
 			fmt.Printf("%v,", t.Type)
@@ -356,4 +372,41 @@ func (p *Parser) PrepareReturns(fn *ast.FuncDecl, List []ast.Stmt) []ast.Stmt {
 		List = append(List, ginResponseCheckError("r1", "r2"))
 	}
 	return List
+}
+
+func (p *Parser) GenerateAddRouterFunc() {
+	decl := &ast.FuncDecl{}
+	decl.Name = &ast.Ident{Name: "AutoAPI_add_router_" + strings.TrimSuffix(p.Name, ".go")}
+	decl.Type = &ast.FuncType{}
+	decl.Type.Params = &ast.FieldList{
+		List: []*ast.Field{{
+			Names: []*ast.Ident{ast.NewIdent("group")},
+			Type:  &ast.SelectorExpr{Sel: &ast.Ident{Name: "RouterGroup"}, X: &ast.Ident{Name: "gin"}},
+		}},
+	}
+	decl.Body = &ast.BlockStmt{List: []ast.Stmt{}}
+	for _, f := range p.FuncInfoList {
+		decl.Body.List = append(decl.Body.List, &ast.ExprStmt{X: &ast.CallExpr{
+			Fun: &ast.SelectorExpr{Sel: &ast.Ident{Name: "POST"}, X: &ast.Ident{Name: "group"}},
+			Args: []ast.Expr{
+				&ast.BasicLit{Value: "\"/autoapi/" + f.Name + "\"", Kind: token.STRING},
+				ast.NewIdent("AutoAPI_handler_" + f.Name),
+			},
+		}})
+	}
+	p.HandlerFunc = append(p.HandlerFunc, decl)
+}
+
+func (p *Parser) GenerateJavaScript(js io.StringWriter) {
+	template, err := os.ReadFile("template.js")
+	if err != nil {
+		fmt.Printf("Cannot open template.js: %s\n", err.Error())
+		return
+	}
+	for _, f := range p.FuncInfoList {
+		name := f.Name
+		x := strings.ReplaceAll(string(template), "GetUser", name)
+		_, _ = js.WriteString(x)
+		_, _ = js.WriteString("\n")
+	}
 }

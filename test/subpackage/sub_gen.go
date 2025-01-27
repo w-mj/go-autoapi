@@ -15,3 +15,6 @@ func AutoAPI_handler_Add(c *gin.Context) {
 		c.JSON(200, gin.H{"ok": true, "data": r1})
 	}
 }
+func AutoAPI_add_router_sub(group gin.RouterGroup) {
+	group.POST("/autoapi/Add", AutoAPI_handler_Add)
+}
